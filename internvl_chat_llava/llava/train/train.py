@@ -34,6 +34,7 @@ from llava.train.llava_trainer import LLaVATrainer
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
+from llava.dynamic_resolution_utils import load_image as dynres_load_image
 
 from PIL import Image
 
@@ -48,8 +49,8 @@ def rank0_print(*args):
 
 @dataclass
 class ModelArguments:
-    model_name_or_path: Optional[str] = field(default="facebook/opt-125m")
-    version: Optional[str] = field(default="v0")
+    model_name_or_path: Optional[str] = field(default="OpenGVLab/InternVL3-2B")
+    version: Optional[str] = field(default="internvl2_5")
     freeze_backbone: bool = field(default=False)
     tune_mm_mlp_adapter: bool = field(default=False)
     tune_vit_pos_embedding: bool = field(default=False)
@@ -71,6 +72,12 @@ class DataArguments:
     image_folder: Optional[str] = field(default=None)
     image_aspect_ratio: str = 'square'
     image_grid_pinpoints: Optional[str] = field(default=None)
+    # data arguments for dynamic resolution strategy (InternVL-1.5 and later)
+    dynamic_resolution: Optional[bool] = field(default=True)
+    base_img_size: Optional[int] = field(default=448)
+    min_subimg_num: Optional[int] = field(default=1)
+    max_subimg_num: Optional[int] = field(default=12)
+    use_thumbnail: Optional[bool] = field(default=True)
 
 
 @dataclass
@@ -183,13 +190,13 @@ def safe_save_model_for_hf_trainer(trainer: transformers.Trainer,
 
     if getattr(trainer.args, "tune_mm_mlp_adapter", False):
         # Only save Adapter
-        keys_to_match = ['mm_projector']
+        keys_to_match = ['mm_projector', 'mlp1']
         if getattr(trainer.args, "use_im_start_end", False):
             keys_to_match.extend(['embed_tokens', 'embed_in'])
 
         # also save pos embedding
         if getattr(trainer.args, "tune_vit_pos_embedding", False):
-            keys_to_match.extend(['vision_tower.embeddings.position_embedding'])
+            keys_to_match.extend(['vision_tower.embeddings.position_embedding', 'vision_model.embeddings.position_embedding'])
 
         weight_to_save = get_mm_adapter_state_maybe_zero_3(trainer.model.named_parameters(), keys_to_match)
         print("weight to save:", weight_to_save.keys())
@@ -319,7 +326,7 @@ def preprocess_multimodal(
                 sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '').strip()
                 sentence['value'] = DEFAULT_IMAGE_TOKEN + '\n' + sentence['value']
                 sentence['value'] = sentence['value'].strip()
-                if "mmtag" in conversation_lib.default_conversation.version:
+                if "mmtag" in conversation_lib.default_conversation.name:
                     sentence['value'] = sentence['value'].replace(DEFAULT_IMAGE_TOKEN, '<Image>' + DEFAULT_IMAGE_TOKEN + '</Image>')
             replace_token = DEFAULT_IMAGE_TOKEN
             if data_args.mm_use_im_start_end:
@@ -568,6 +575,72 @@ def preprocess_mpt(
     )
 
 
+def preprocess_internvl2_5(
+    sources: Sequence[str], 
+    tokenizer: transformers.PreTrainedTokenizer, 
+) -> Dict:
+    conv = conversation_lib.default_conversation.copy()
+    roles = {"human": conv.roles[0], "gpt": conv.roles[1]}
+
+    # Apply prompt templates
+    conversations = []
+    for i, source in enumerate(sources):
+        if roles[source[0]["from"]] != conv.roles[0]:
+            # Skip the first one if it is not from human
+            source = source[1:]
+
+        conv.messages = []
+        for j, sentence in enumerate(source):
+            role = roles[sentence["from"]]
+            assert role == conv.roles[j % 2], f"{i}"
+            conv.append_message(role, sentence["value"])
+        conversations.append(conv.get_prompt())
+
+    # Tokenize conversations
+    assert conv.sep_style == conversation_lib.SeparatorStyle.MPT
+    input_ids = torch.stack([tokenizer_image_token(prompt, tokenizer, return_tensors='pt') for prompt in conversations], dim=0)
+    targets = input_ids.clone()
+
+    # Mask targets
+    sep = conv.sep + conv.roles[1]  # <|im_end|>\n<|assistant|>\n
+    for conversation, target in zip(conversations, targets):
+        total_len = int(target.ne(tokenizer.pad_token_id).sum())
+
+        rounds = conversation.split(conv.sep)
+        re_rounds = [conv.sep.join(rounds[:3])] # system + user + gpt
+        for conv_idx in range(3, len(rounds), 2):
+            re_rounds.append(conv.sep.join(rounds[conv_idx: conv_idx + 2]))    # user + gpt
+        cur_len = 0
+        target[: cur_len] = IGNORE_INDEX
+        for i, rou in enumerate(re_rounds):
+            if rou == "":
+                break
+
+            parts = rou.split(sep)
+            if len(parts) != 2:
+                break
+            parts[0] += sep
+            round_len = len(tokenizer_image_token(rou, tokenizer)) + len(tokenizer_image_token(conv.sep, tokenizer))
+            instruction_len = len(tokenizer_image_token(parts[0], tokenizer))
+            target[cur_len : cur_len + instruction_len] = IGNORE_INDEX
+
+            cur_len += round_len
+        target[cur_len:] = IGNORE_INDEX
+
+        if cur_len < tokenizer.model_max_length:
+            if cur_len != total_len:
+                target[:] = IGNORE_INDEX
+                print(
+                    f"WARNING: tokenization mismatch: {cur_len} vs. {total_len}."
+                    f" (ignored)"
+                )
+
+    return dict(
+        input_ids=input_ids,
+        labels=targets,
+    )
+
+
 def preprocess_plain(
     sources: Sequence[str],
     tokenizer: transformers.PreTrainedTokenizer,
@@ -606,9 +679,11 @@ def preprocess(
         return preprocess_plain(sources, tokenizer)
     if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.LLAMA_2:
         return preprocess_llama_2(sources, tokenizer, has_image=has_image)
-    if conversation_lib.default_conversation.version.startswith("v1"):
+    if "v1" in conversation_lib.default_conversation.name:
         return preprocess_v1(sources, tokenizer, has_image=has_image)
-    if conversation_lib.default_conversation.version == "mpt":
+    if "internvl2_5" in conversation_lib.default_conversation.name or "internvl3" in conversation_lib.default_conversation.name:
+        return preprocess_internvl2_5(sources, tokenizer)
+    if conversation_lib.default_conversation.sep_style == conversation_lib.SeparatorStyle.MPT:
         return preprocess_mpt(sources, tokenizer)
     # add end signal and concatenate together
     conversations = []
@@ -684,27 +759,41 @@ class LazySupervisedDataset(Dataset):
                     image_file = self.list_data_dict[i]['image']
                     image_folder = self.data_args.image_folder
                     processor = self.data_args.image_processor
-                    image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
-                    if self.data_args.image_aspect_ratio == 'pad':
-                        def expand2square(pil_img, background_color):
-                            width, height = pil_img.size
-                            if width == height:
-                                return pil_img
-                            elif width > height:
-                                result = Image.new(pil_img.mode, (width, width), background_color)
-                                result.paste(pil_img, (0, (width - height) // 2))
-                                return result
-                            else:
-                                result = Image.new(pil_img.mode, (height, height), background_color)
-                                result.paste(pil_img, ((height - width) // 2, 0))
-                                return result
-                        image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
-                        image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                    if not self.data_args.dynamic_resolution:
+                        image = Image.open(os.path.join(image_folder, image_file)).convert('RGB')
+                        if self.data_args.image_aspect_ratio == 'pad':
+                            def expand2square(pil_img, background_color):
+                                width, height = pil_img.size
+                                if width == height:
+                                    return pil_img
+                                elif width > height:
+                                    result = Image.new(pil_img.mode, (width, width), background_color)
+                                    result.paste(pil_img, (0, (width - height) // 2))
+                                    return result
+                                else:
+                                    result = Image.new(pil_img.mode, (height, height), background_color)
+                                    result.paste(pil_img, ((height - width) // 2, 0))
+                                    return result
+                            image = expand2square(image, tuple(int(x*255) for x in processor.image_mean))
+                            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                        else:
+                            image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
                     else:
-                        image = processor.preprocess(image, return_tensors='pt')['pixel_values'][0]
+                        img_file = pathlib.Path(image_folder) / image_file
+                        input_size = self.data_args.base_img_size
+                        min_num = self.data_args.min_subimg_num
+                        max_num = self.data_args.max_subimg_num
+                        use_thumbnail = self.data_args.use_thumbnail
+                        image = dynres_load_image(
+                                                  image_file=img_file, input_size=input_size, 
+                                                  min_num=min_num, max_num=max_num, 
+                                                  use_thumbnail=use_thumbnail
+                                                 )
                     sources = preprocess_multimodal(
                         copy.deepcopy([e["conversations"] for e in sources]),
                         self.data_args)
+                # elif "video" in sources[0]:
+                #     pass
                 else:
                     sources = copy.deepcopy([e["conversations"] for e in sources])
                 data_dict = preprocess(
@@ -712,15 +801,22 @@ class LazySupervisedDataset(Dataset):
                     self.tokenizer,
                     has_image=('image' in self.list_data_dict[i]))
                 if isinstance(i, int):
-                    data_dict = dict(input_ids=data_dict["input_ids"][0],
-                                    labels=data_dict["labels"][0])
+                    data_dict = dict(
+                                     input_ids=data_dict["input_ids"][0],
+                                     labels=data_dict["labels"][0]
+                                    )
 
                 # image exist in the data
                 if 'image' in self.list_data_dict[i]:
                     data_dict['image'] = image
+                # elif 'video' in self.list_data_dict[i]:
+                #     pass
                 elif self.data_args.is_multimodal:
                     # image does not exist in the data, but the model is multimodal
-                    crop_size = self.data_args.image_processor.crop_size
+                    if not self.data_args.dynamic_resolution:
+                        crop_size = self.data_args.image_processor.crop_size
+                    else:
+                        crop_size = self.data_args.base_img_size
                     data_dict['image'] = torch.zeros(3, crop_size['height'], crop_size['width'])
                 flag = True
             except Exception as e:
@@ -734,31 +830,45 @@ class DataCollatorForSupervisedDataset(object):
     """Collate examples for supervised fine-tuning."""
 
     tokenizer: transformers.PreTrainedTokenizer
+    data_args: DataArguments
 
     def __call__(self, instances: Sequence[Dict]) -> Dict[str, torch.Tensor]:
         input_ids, labels = tuple([instance[key] for instance in instances]
                                   for key in ("input_ids", "labels"))
         input_ids = torch.nn.utils.rnn.pad_sequence(
-            input_ids,
-            batch_first=True,
-            padding_value=self.tokenizer.pad_token_id)
-        labels = torch.nn.utils.rnn.pad_sequence(labels,
+                                                    input_ids,
+                                                    batch_first=True,
+                                                    padding_value=self.tokenizer.pad_token_id
+                                                   )
+        labels = torch.nn.utils.rnn.pad_sequence(
+                                                 labels,
                                                  batch_first=True,
-                                                 padding_value=IGNORE_INDEX)
+                                                 padding_value=IGNORE_INDEX
+                                                )
         input_ids = input_ids[:, :self.tokenizer.model_max_length]
         labels = labels[:, :self.tokenizer.model_max_length]
         batch = dict(
-            input_ids=input_ids,
-            labels=labels,
-            attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
-        )
+                     input_ids=input_ids,
+                     labels=labels,
+                     attention_mask=input_ids.ne(self.tokenizer.pad_token_id),
+                    )
 
         if 'image' in instances[0]:
             images = [instance['image'] for instance in instances]
-            if all(x is not None and x.shape == images[0].shape for x in images):
-                batch['images'] = torch.stack(images)
+            if not self.data_args.dynamic_resolution:
+                if all(x is not None and x.shape == images[0].shape for x in images):
+                    batch['images'] = torch.stack(images)
+                else:
+                    batch['images'] = images
             else:
-                batch['images'] = images
+                # TODO: Now here
+                # TODO: maybe need additional modifications (return the mini-batch number per image)
+                if all(x is not None and x.shape[1: ] == images[0].shape[1: ] for x in images):
+                    batch["images"] = torch.cat(images)
+                else:
+                    batch["images"] = images
+        # if 'video' in instances[0]:
+        #     pass
 
         return batch
 
@@ -766,13 +876,17 @@ class DataCollatorForSupervisedDataset(object):
 def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                                 data_args) -> Dict:
     """Make dataset and collator for supervised fine-tuning."""
-    train_dataset = LazySupervisedDataset(tokenizer=tokenizer,
-                                data_path=data_args.data_path,
-                                data_args=data_args)
-    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer)
-    return dict(train_dataset=train_dataset,
+    train_dataset = LazySupervisedDataset(
+                                          tokenizer=tokenizer,
+                                          data_path=data_args.data_path,
+                                          data_args=data_args
+                                         )
+    data_collator = DataCollatorForSupervisedDataset(tokenizer=tokenizer, data_args=data_args)
+    return dict(
+                train_dataset=train_dataset,
                 eval_dataset=None,
-                data_collator=data_collator)
+                data_collator=data_collator
+               )
 
 
 def train(attn_implementation=None):
@@ -786,6 +900,10 @@ def train(attn_implementation=None):
     data_args._frozen = False  # compatible with transformers==4.32.0
     model_args._frozen = False  # compatible with transformers==4.32.0
     compute_dtype = (torch.float16 if training_args.fp16 else (torch.bfloat16 if training_args.bf16 else torch.float32))
+    internvl_flag = "internvl2_5" in model_args.model_name_or_path.lower() or "internvl3" in model_args.model_name_or_path.lower()
+    if internvl_flag:
+        model_args.mm_use_im_start_end = False
+        model_args.mm_use_im_patch_token = False
 
     bnb_model_from_pretrained_args = {}
     if training_args.bits in [4, 8]:
@@ -823,6 +941,18 @@ def train(attn_implementation=None):
                 torch_dtype=(torch.bfloat16 if training_args.bf16 else None),
                 **bnb_model_from_pretrained_args
             )
+    elif internvl_flag:
+        model_args.vision_tower = None
+        if attn_implementation == "flash_attention_2":
+            use_flash_attn = True
+        else:
+            use_flash_attn = False
+        model = InternVLChatModel.from_pretrained(
+                                                  model_args.model_name_or_path, use_flash_attn=use_flash_attn, trust_remote_code=False, 
+                                                  cache_dir=training_args.cache_dir, 
+                                                  torch_dtype=(torch.bfloat16 if training_args.bf16 else None), 
+                                                  **bnb_model_from_pretrained_args
+                                                 )
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,
@@ -834,7 +964,13 @@ def train(attn_implementation=None):
     model.config.use_cache = False
 
     if model_args.freeze_backbone:
-        model.model.requires_grad_(False)
+        if not internvl_flag:
+            model.model.requires_grad_(False)
+        else:
+            model.vision_model.requires_grad_(False)
+            model.mlp1.requires_grad_(False)
+            model.language_model.requires_grad_(False)
+            model.language_model.lm_head.requires_grad_(True)
 
     if training_args.bits in [4, 8]:
         from peft import prepare_model_for_kbit_training
@@ -852,13 +988,13 @@ def train(attn_implementation=None):
     if training_args.lora_enable:
         from peft import LoraConfig, get_peft_model
         lora_config = LoraConfig(
-            r=training_args.lora_r,
-            lora_alpha=training_args.lora_alpha,
-            target_modules=find_all_linear_names(model),
-            lora_dropout=training_args.lora_dropout,
-            bias=training_args.lora_bias,
-            task_type="CAUSAL_LM",
-        )
+                                 r=training_args.lora_r,
+                                 lora_alpha=training_args.lora_alpha,
+                                 target_modules=find_all_linear_names(model),
+                                 lora_dropout=training_args.lora_dropout,
+                                 bias=training_args.lora_bias,
+                                 task_type="CAUSAL_LM",
+                                )
         if training_args.bits == 16:
             if training_args.bf16:
                 model.to(torch.bfloat16)
@@ -874,6 +1010,12 @@ def train(attn_implementation=None):
             model_max_length=training_args.model_max_length,
             padding_side="right"
         )
+    elif internvl_flag:
+        tokenizer = transformers.AutoTokenizer.from_pretrained(
+                                                               model_args.model_name_or_path, cache_dir=training_args.cache_dir, 
+                                                               model_max_length=training_args.model_max_length, padding_side="right", 
+                                                               trust_remote_code=True, use_fast=False
+                                                              )
     else:
         tokenizer = transformers.AutoTokenizer.from_pretrained(
             model_args.model_name_or_path,
@@ -893,18 +1035,19 @@ def train(attn_implementation=None):
     elif model_args.version == "v0.5":
         tokenizer.pad_token = tokenizer.unk_token
     else:
-        tokenizer.pad_token = tokenizer.unk_token
+        if tokenizer.pad_token is None:
+            tokenizer.pad_token = tokenizer.unk_token
         if model_args.version in conversation_lib.conv_templates:
             conversation_lib.default_conversation = conversation_lib.conv_templates[model_args.version]
         else:
-            conversation_lib.default_conversation = conversation_lib.conv_templates["vicuna_v1"]
+            conversation_lib.default_conversation = conversation_lib.conv_templates["internvl2_5"]
 
     if model_args.vision_tower is not None:
         model.get_model().initialize_vision_modules(
             model_args=model_args,
             fsdp=training_args.fsdp
         )
-        
+
         vision_tower = model.get_vision_tower()
         vision_tower.to(dtype=torch.bfloat16 if training_args.bf16 else torch.float16, device=training_args.device)
 
@@ -936,7 +1079,6 @@ def train(attn_implementation=None):
                     p.requires_grad = True
                     print("\tvit pos embedding name: ", name)
 
-
         if training_args.bits in [4, 8]:
             model.get_model().mm_projector.to(dtype=compute_dtype, device=training_args.device)
 
@@ -944,6 +1086,34 @@ def train(attn_implementation=None):
         training_args.use_im_start_end = model_args.mm_use_im_start_end
         model.config.mm_use_im_patch_token = model_args.mm_use_im_patch_token
         model.initialize_vision_tokenizer(model_args, tokenizer=tokenizer)
+
+    elif internvl_flag:
+        data_args.is_multimodal = True
+
+        model.config.tune_mm_mlp_adapter = training_args.tune_mm_mlp_adapter = model_args.tune_mm_mlp_adapter
+        if model_args.tune_mm_mlp_adapter or training_args.freeze_llm:
+            print("Only tune mlp adapter")
+            model.requires_grad_(False)
+            for p in model.mlp1.parameters():
+                p.requires_grad = True
+
+        model.config.freeze_mm_mlp_adapter = training_args.freeze_mm_mlp_adapter
+        if training_args.freeze_mm_mlp_adater:
+            model.requires_grad_(True)
+            for p in model.mlp1.parameters():
+                p.requires_grad = False
+
+        # tune Intern-ViT positional embedding
+        model.config.tune_vit_pos_embedding = training_args.tune_vit_pos_embedding = model_args.tune_vit_pos_embedding
+        if model_args.tune_vit_pos_embedding:
+            print("Tuning ViT position embedding")
+            for name, p in model.vision_model.named_parameters():
+                if "position_embedding" in name:
+                    p.requires_grad = True
+                    print("\tIntern-ViT pos embedding name: ", name)
+
+        if training_args.bits in (4, 8):
+            model.mlp1.to(dtype=compute_dtype, device=training_args.device)
 
     if training_args.bits in [4, 8]:
         from peft.tuners.lora import LoraLayer
@@ -953,17 +1123,25 @@ def train(attn_implementation=None):
                     module = module.to(torch.bfloat16)
             if 'norm' in name:
                 module = module.to(torch.float32)
+            if internvl_flag:
+                for layer in model.mlp1:
+                    if isinstance(layer, torch.nn.LayerNorm):
+                        layer = layer.to(torch.float32)
             if 'lm_head' in name or 'embed_tokens' in name:
                 if hasattr(module, 'weight'):
                     if training_args.bf16 and module.weight.dtype == torch.float32:
                         module = module.to(torch.bfloat16)
 
+    # TODO: Now here
+    # TODO: use IterableDataset & webdataset
     data_module = make_supervised_data_module(tokenizer=tokenizer,
                                               data_args=data_args)
-    trainer = LLaVATrainer(model=model,
-                    tokenizer=tokenizer,
-                    args=training_args,
-                    **data_module)
+    trainer = LLaVATrainer(
+                           model=model,
+                           tokenizer=tokenizer,
+                           args=training_args,
+                           **data_module
+                          )
 
     if list(pathlib.Path(training_args.output_dir).glob("checkpoint-*")):
         trainer.train(resume_from_checkpoint=True)
@@ -985,8 +1163,7 @@ def train(attn_implementation=None):
             model.save_pretrained(training_args.output_dir, state_dict=state_dict)
             torch.save(non_lora_state_dict, os.path.join(training_args.output_dir, 'non_lora_trainables.bin'))
     else:
-        safe_save_model_for_hf_trainer(trainer=trainer,
-                                       output_dir=training_args.output_dir)
+        safe_save_model_for_hf_trainer(trainer=trainer, output_dir=training_args.output_dir)
 
 
 if __name__ == "__main__":

@@ -156,13 +156,13 @@ class LLaVATrainer(Trainer):
             output_dir = os.path.join(run_dir, checkpoint_folder)
 
             # Only save Adapter
-            keys_to_match = ['mm_projector', 'vision_resampler']
+            keys_to_match = ['mm_projector', 'vision_resampler', 'mlp1']
             if getattr(self.args, "use_im_start_end", False):
                 keys_to_match.extend(['embed_tokens', 'embed_in'])
 
             # also save pos embedding
             if getattr(self.args, "tune_vit_pos_embedding", False):
-                keys_to_match.extend(['vision_tower.embeddings.position_embedding'])
+                keys_to_match.extend(['vision_tower.embeddings.position_embedding', 'vision_model.embeddings.position_embedding'])
 
             weight_to_save = get_mm_adapter_state_maybe_zero_3(self.model.named_parameters(), keys_to_match)
             print("weight to save:", weight_to_save.keys())

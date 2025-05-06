@@ -474,19 +474,19 @@ register_conv_template(conv_vicuna_v1)
 
 # Internlm-chat template
 conv_internlm = Conversation(
-        name="internlm",
-        system_message=(
-                        "A chat between a curious <|User|> and an <|Bot|>. The <|Bot|> gives helpful, "
-                        "detailed, and polite answers to the <|User|>'s questions.\n\n"
-                       ),
-        roles=("<|User|>", "<|Bot|>"),
-        messages=[],
-        offset=0,
-        sep_style=SeparatorStyle.CHATINTERN,
-        sep="<eoh>",
-        sep2="<eoa>",
-        stop_token_ids=[1, 103028],
-        stop_str="<|User|>",
+    name="internlm",
+    system_message=(
+                    "A chat between a curious <|User|> and an <|Bot|>. The <|Bot|> gives helpful, "
+                    "detailed, and polite answers to the <|User|>'s questions.\n\n"
+                   ),
+    roles=("<|User|>", "<|Bot|>"),
+    messages=[],
+    offset=0,
+    sep_style=SeparatorStyle.CHATINTERN,
+    sep="<eoh>",
+    sep2="<eoa>",
+    stop_token_ids=[1, 103028],
+    stop_str="<|User|>",
 )
 register_conv_template(conv_internlm)
 
@@ -617,7 +617,7 @@ register_conv_template(conv_llava_v1)
 
 conv_llava_v1_mmtag = Conversation(
     name="v1_mmtag", 
-    system=(
+    system_message=(
             "A chat between a curious user and an artificial intelligence assistant. "
             "The assistant is able to understand the visual content that the user provides, and assist the user with a variety of tasks using natural language."
             "The visual content will be provided with the following format: <Image>visual content</Image>."
@@ -634,7 +634,7 @@ register_conv_template(conv_llava_v1_mmtag)
 
 internvl_zh = Conversation(
     name="internvl_zh", 
-    system="",
+    system_message="",
     roles=("<human>", "<bot>"),
     messages=[],
     offset=0,

@@ -85,8 +85,6 @@ class LlavaMetaModel:
                     print("unexpected_keys:\n", unexpected_keys)
 
 
-
-
 class LlavaMetaForCausalLM(ABC):
 
     @abstractmethod
