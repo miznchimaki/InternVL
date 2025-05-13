@@ -36,7 +36,7 @@ class Conversation:
     name: str
     system_template: str = '{system_message}'
     system_message: str = ''
-    roles: Tuple[str]
+    roles: Tuple[str] = ('user', 'gpt')
     messages: List[List[str]] = ()
     offset: int = 0
     sep_style: SeparatorStyle = SeparatorStyle.SINGLE
@@ -697,6 +697,18 @@ register_conv_template(internvl2_5)
 
 
 default_conversation = internvl2_5
+
+
+def set_default_conv_template(conv_temp: Union[str, Conversation]):
+    """Set default conversation template"""
+    if not isinstance(conv_temp, (str, Conversation)):
+        raise TypeError(f"type of param `conv_temp` should be str or Conversation")
+    if isinstance(conv_temp, str):
+        default_conversation = conv_templates[conv_temp]
+    if isinstance(conv_temp, Conversation):
+        default_conversation = conv_temp
+
+    return
 
 
 if __name__ == "__main__":

@@ -21,13 +21,16 @@ import json
 import logging
 import pathlib
 from typing import Dict, Optional, Sequence, List
+from functools import partial
 
 import torch
 import random
 
 import transformers
+import webdataset as wds
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
+from llava.constants import SHARD_SHUFFLE_SIZE, SHARD_SHUFFLE_INITIAL, SAMPLE_SHUFFLE_SIZE, SAMPLE_SHUFFLE_INITIAL
 from torch.utils.data import Dataset
 from llava.train.llava_trainer import LLaVATrainer
 
@@ -35,6 +38,8 @@ from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
 from llava.dynamic_resolution_utils import load_image as dynres_load_image
+from llava.dynamic_resolution_utils import wds_img_transform
+from ..taisu2_preprocess import taisu2_text_preprocess
 
 from PIL import Image
 
@@ -78,6 +83,17 @@ class DataArguments:
     min_subimg_num: Optional[int] = field(default=1)
     max_subimg_num: Optional[int] = field(default=12)
     use_thumbnail: Optional[bool] = field(default=True)
+    # data arguments for tokenizer
+    padding: Optional[str | bool] = field(default=False)
+    padding_side: Optional[str | None] = field(default=None)
+    return_tensors: Optional[str | None] = field(default=None)
+    return_attention_mask: Optional[bool | None] = field(default=None)
+    # data arguments for webdataset
+    wds_shards_folder: Optional[str] = field(default="image-alttext-total-8.00M-at-2025-04-11-19:42:01")
+    wds_shards_subfolder: Optional[str] = field(default="rename_and_rearchive")
+    wds_batch_per_epoch: Optional[int] = field(default=None)
+    wds_last_batch: Optional[bool] = field(default=True)
+    wds_shuffle_seed: Optional[int] = field(default=42)
 
 
 @dataclass
@@ -602,7 +618,7 @@ def preprocess_internvl2_5(
     targets = input_ids.clone()
 
     # Mask targets
-    sep = conv.sep + conv.roles[1]  # <|im_end|>\n<|assistant|>\n
+    sep = conv.sep + conv.roles[1]  # <|im_end|>\n<|im_start|>assistant\n
     for conversation, target in zip(conversations, targets):
         total_len = int(target.ne(tokenizer.pad_token_id).sum())
 
@@ -861,8 +877,6 @@ class DataCollatorForSupervisedDataset(object):
                 else:
                     batch['images'] = images
             else:
-                # TODO: Now here
-                # TODO: maybe need additional modifications (return the mini-batch number per image)
                 if all(x is not None and x.shape[1: ] == images[0].shape[1: ] for x in images):
                     batch["images"] = torch.cat(images)
                 else:
@@ -887,6 +901,109 @@ def make_supervised_data_module(tokenizer: transformers.PreTrainedTokenizer,
                 eval_dataset=None,
                 data_collator=data_collator
                )
+
+
+@dataclass
+class DataCollatorForWebDataset(object):
+    """Collate image-text data for webdataset IterableDataset"""
+    pad_token_id: int
+    conv_name: str
+
+    def __call__(self, img_text_data: Sequence[Dict]) -> Dict[str, torch.Tensor]:
+        batch_input_ids = (data["input_ids"] for data in img_text_data)
+        batch_labels = (data["labels"] for data in img_text_data)
+        batch_input_ids = torch.nn.utils.rnn.pad_sequence(
+                                                          batch_input_ids, 
+                                                          batch_first=True, 
+                                                          padding_value=self.pad_token_id
+                                                         )
+        batch_labels = torch.nn.utils.rnn.pad_sequence(
+                                                       batch_labels, 
+                                                       batch_first=True, 
+                                                       padding_value=IGNORE_INDEX
+                                                      )
+        batch_no_imgs = all("pixel_values" not in data for data in img_text_data)
+        if batch_no_imgs:
+            return dict(
+                        input_ids=batch_input_ids, 
+                        labels=batch_labels, 
+                        pixel_values=None
+                       )
+        else:
+            batch_imgs = (data["pixel_values"] for data in img_text_data)
+            batch_imgs = torch.cat(batch_imgs, dim=0)
+            if "internvl2_5" in self.conv_name or "internvl3" in self.conv_name:
+                image_flags = torch.ones((batch_imgs.shape(0), 1), dtype=torch.int)
+                return dict(
+                            input_ids=batch_input_ids, 
+                            labels=batch_labels, 
+                            pixel_values=batch_imgs, 
+                            image_flags=image_flags
+                           )
+
+
+def wds_train_map_func(wds_sample: Dict, tokenizer: transformers.PreTrainedTokenizer = None, data_args: DataArguments = None):
+    no_img = "jpg" not in wds_sample and "jpeg" not in wds_sample and "png" not in wds_sample
+    no_txt = "txt" not in wds_sample; no_json = "json" not in wds_sample
+    if no_img or no_txt:
+        raise KeyError(f"each sample dictionary must have image and text keys")
+    if "image-alttext" in wds_sample["__url__"]:
+        task_type = "caption"
+    wds_img_map = partial(
+                          wds_img_transform, 
+                          input_size=data_args.base_img_size, 
+                          min_num=data_args.min_subimg_num, 
+                          max_num=data_args.max_subimg_num, use_thumbnail=data_args.use_thumbnail
+                         )
+    img_map_res = wds_img_map(wds_sample["jpg"])
+    pixel_values = img_map_res["pixel_values"]
+    sub_img_num = img_map_res["sub_img_num"]
+    imgname = wds_sample["__key__"] + ".jpg"
+
+    wds_text_map = partial(taisu2_text_preprocess, tokenizer=tokenizer, data_args=data_args)
+    text_map_res = wds_text_map(wds_sample["txt"], imgname, task_type, sub_img_num)
+    input_ids = text_map_res["input_ids"]
+    labels = text_map_res["labels"]
+
+    return dict(
+                input_ids=input_ids, 
+                pixel_values=pixel_values, 
+                labels=labels
+               )
+
+
+def make_wds_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments = None) -> Dict:
+    """Make training and evaluation webdataset iterable for pretraining & supervised fine-tuning"""
+    data_root_dir = pathlib.Path(os.getenv("HOME", "")) / "datasets" / "Taisu2_datasets"
+    wds_shards_p = data_root_dir / f"{data_args.wds_shards_folder}" / f"{data_args.wds_shards_subfolder}" / "image-text-pairs"
+    if not wds_shards_p.exists():
+        raise FileNotFoundError(f"sharded tar files directory - {wds_shards_p}, does not exist!")
+
+    def get_first_and_last_tarnames() -> List[str, str]:
+        tar_names = sorted(os.listdir(wds_shards_p))
+        return (tar_names[0].split(".")[0], tar_names[-1].split(".")[0])
+
+    first_tarname, last_tarname = get_first_and_last_tarnames()
+    wds_train_urls = f"{wds_shards_p}" + f"{first_tarname}.." + f"{last_tarname}.tar"
+    wds_train_pipeline = [wds.SimpleShardList(urls=wds_train_urls)]
+    wds_train_pipeline.append(
+        wds.detshuffle(bufsize=SHARD_SHUFFLE_SIZE, initial=SHARD_SHUFFLE_INITIAL, seed=data_args.wds_shuffle_seed)
+    )
+    wds_train_pipeline.append(wds.split_by_node)
+    wds_train_pipeline.append(wds.split_by_worker)
+    wds_train_pipeline.append(wds.tarfile_to_samples())
+    wds_train_pipeline.append(wds.detshuffle(bufsize=SAMPLE_SHUFFLE_SIZE, initial=SAMPLE_SHUFFLE_INITIAL, seed=data_args.wds_shuffle_seed))
+    wds_train_pipeline.append(wds.decode("pil"))
+    wds_train_pipeline.append(wds.map(partial(wds_train_map_func, tokenizer=tokenizer, data_args=data_args)))
+    train_web_ds = wds.DataPipeline(*wds_train_pipeline)
+
+    web_ds_collator = DataCollatorForWebDataset(pad_token_id=tokenizer.pad_token_id, conv_name=conversation_lib.default_conversation.name)
+
+    return dict(
+        train_dataset=train_web_ds, 
+        eval_dataset=None, 
+        data_collator=web_ds_collator, 
+    )
 
 
 def train(attn_implementation=None):
@@ -953,6 +1070,7 @@ def train(attn_implementation=None):
                                                   torch_dtype=(torch.bfloat16 if training_args.bf16 else None), 
                                                   **bnb_model_from_pretrained_args
                                                  )
+        data_args.context_token_per_img = model.num_image_token
     else:
         model = transformers.LlamaForCausalLM.from_pretrained(
             model_args.model_name_or_path,

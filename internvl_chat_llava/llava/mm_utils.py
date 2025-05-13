@@ -41,12 +41,20 @@ def process_images(images, image_processor, model_cfg):
     return new_images
 
 
-def tokenizer_image_token(prompt: str, tokenizer: PreTrainedTokenizer, image_token_index=IMAGE_TOKEN_INDEX, return_tensors=None):
+def tokenizer_image_token(
+                          prompt: str, 
+                          tokenizer: PreTrainedTokenizer, 
+                          image_token_index: int = IMAGE_TOKEN_INDEX, 
+                          padding: str = "longest", 
+                          padding_side: str = "right", 
+                          return_attention_mask: bool = True, 
+                          return_tensors: str = None
+                         ):
     # prompt_chunks = [tokenizer(chunk).input_ids for chunk in prompt.split('<image>')]
     prompt_chunks = []  # compatible with transformers==4.32.0
     for chunk in prompt.split('<image>'):
         if len(chunk) > 0:
-            prompt_chunks.append(tokenizer(chunk).input_ids)
+            prompt_chunks.append(tokenizer(chunk, padding=padding, padding_side=padding_side, return_attention_mask=return_attention_mask).input_ids)
         elif hasattr(tokenizer, "bos_token_id") and tokenizer.bos_token_id is not None:
             prompt_chunks.append([tokenizer.bos_token_id])
 
@@ -76,8 +84,6 @@ def get_model_name_from_path(model_path):
         return model_paths[-2] + "_" + model_paths[-1]
     else:
         return model_paths[-1]
-
-
 
 
 class KeywordsStoppingCriteria(StoppingCriteria):

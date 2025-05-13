@@ -86,3 +86,13 @@ def load_image(image_file: Union[str | PosixPath], input_size: int = 448, min_nu
     pixel_values = torch.stack(pixel_values)
 
     return pixel_values
+
+
+def wds_img_transform(pil_img: ImageFile, input_size: int = 448, min_num: int = 1, 
+                      max_num: int = 12, use_thumbnail: bool = True) -> Tuple[Image.Image | ImageFile, int]:
+    transform = build_transform(input_size=input_size)
+    pil_images = dynamic_preprocess(pil_img, min_num=min_num, max_num=max_num, image_size=input_size, use_thumbnail=use_thumbnail)
+    pixel_values = [transform(pil_image) for pil_image in pil_images]
+    pixel_values = torch.stack(pixel_values)
+
+    return dict(pixel_value=pixel_values, sub_img_num=len(pil_images))
