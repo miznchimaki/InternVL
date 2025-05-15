@@ -10,7 +10,7 @@ from transformers import LlamaConfig, Qwen2Config
 from transformers.configuration_utils import PretrainedConfig
 from transformers.utils import logging
 
-from ...multimodal_encoder.intern_vit.configuration_intern_vit import InternVisionConfig
+from llava.model.multimodal_encoder.intern_vit.configuration_intern_vit import InternVisionConfig
 
 logger = logging.get_logger(__name__)
 

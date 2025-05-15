@@ -28,6 +28,7 @@ import random
 
 import transformers
 import webdataset as wds
+from llava.multifile_tariterators import tarfile_to_samples
 
 from llava.constants import IGNORE_INDEX, IMAGE_TOKEN_INDEX, DEFAULT_IMAGE_TOKEN, DEFAULT_IM_START_TOKEN, DEFAULT_IM_END_TOKEN
 from llava.constants import SHARD_SHUFFLE_SIZE, SHARD_SHUFFLE_INITIAL, SAMPLE_SHUFFLE_SIZE, SAMPLE_SHUFFLE_INITIAL
@@ -37,9 +38,8 @@ from llava.train.llava_trainer import LLaVATrainer
 from llava import conversation as conversation_lib
 from llava.model import *
 from llava.mm_utils import tokenizer_image_token
-from llava.dynamic_resolution_utils import load_image as dynres_load_image
-from llava.dynamic_resolution_utils import wds_img_transform
-from ..taisu2_preprocess import taisu2_text_preprocess
+from llava.taisu2_preprocess import load_image as dynres_load_image
+from llava.taisu2_preprocess import taisu2_wds_map
 
 from PIL import Image
 
@@ -94,6 +94,8 @@ class DataArguments:
     wds_batch_per_epoch: Optional[int] = field(default=None)
     wds_last_batch: Optional[bool] = field(default=True)
     wds_shuffle_seed: Optional[int] = field(default=42)
+    # data arguments for image-text preprocessing
+    txts_separator: Optional[str] = field(default="\n")
 
 
 @dataclass
@@ -927,7 +929,8 @@ class DataCollatorForWebDataset(object):
             return dict(
                         input_ids=batch_input_ids, 
                         labels=batch_labels, 
-                        pixel_values=None
+                        pixel_values=None, 
+                        image_flags=None
                        )
         else:
             batch_imgs = (data["pixel_values"] for data in img_text_data)
@@ -940,36 +943,6 @@ class DataCollatorForWebDataset(object):
                             pixel_values=batch_imgs, 
                             image_flags=image_flags
                            )
-
-
-def wds_train_map_func(wds_sample: Dict, tokenizer: transformers.PreTrainedTokenizer = None, data_args: DataArguments = None):
-    no_img = "jpg" not in wds_sample and "jpeg" not in wds_sample and "png" not in wds_sample
-    no_txt = "txt" not in wds_sample; no_json = "json" not in wds_sample
-    if no_img or no_txt:
-        raise KeyError(f"each sample dictionary must have image and text keys")
-    if "image-alttext" in wds_sample["__url__"]:
-        task_type = "caption"
-    wds_img_map = partial(
-                          wds_img_transform, 
-                          input_size=data_args.base_img_size, 
-                          min_num=data_args.min_subimg_num, 
-                          max_num=data_args.max_subimg_num, use_thumbnail=data_args.use_thumbnail
-                         )
-    img_map_res = wds_img_map(wds_sample["jpg"])
-    pixel_values = img_map_res["pixel_values"]
-    sub_img_num = img_map_res["sub_img_num"]
-    imgname = wds_sample["__key__"] + ".jpg"
-
-    wds_text_map = partial(taisu2_text_preprocess, tokenizer=tokenizer, data_args=data_args)
-    text_map_res = wds_text_map(wds_sample["txt"], imgname, task_type, sub_img_num)
-    input_ids = text_map_res["input_ids"]
-    labels = text_map_res["labels"]
-
-    return dict(
-                input_ids=input_ids, 
-                pixel_values=pixel_values, 
-                labels=labels
-               )
 
 
 def make_wds_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args: DataArguments = None) -> Dict:
@@ -991,10 +964,10 @@ def make_wds_data_module(tokenizer: transformers.PreTrainedTokenizer, data_args:
     )
     wds_train_pipeline.append(wds.split_by_node)
     wds_train_pipeline.append(wds.split_by_worker)
-    wds_train_pipeline.append(wds.tarfile_to_samples())
+    wds_train_pipeline.append(tarfile_to_samples())
     wds_train_pipeline.append(wds.detshuffle(bufsize=SAMPLE_SHUFFLE_SIZE, initial=SAMPLE_SHUFFLE_INITIAL, seed=data_args.wds_shuffle_seed))
-    wds_train_pipeline.append(wds.decode("pil"))
-    wds_train_pipeline.append(wds.map(partial(wds_train_map_func, tokenizer=tokenizer, data_args=data_args)))
+    wds_train_map = partial(taisu2_wds_map, tokenizer=tokenizer, data_args=data_args)
+    wds_train_pipeline.append(wds.map(wds_train_map))
     train_web_ds = wds.DataPipeline(*wds_train_pipeline)
 
     web_ds_collator = DataCollatorForWebDataset(pad_token_id=tokenizer.pad_token_id, conv_name=conversation_lib.default_conversation.name)

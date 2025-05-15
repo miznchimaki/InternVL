@@ -17,9 +17,9 @@ from transformers.modeling_outputs import CausalLMOutputWithPast
 from transformers.modeling_utils import PreTrainedModel
 from transformers.utils import logging
 
-from .configuration_internvl_chat import InternVLChatConfig
-from ....conversation import get_conv_template
-from ...multimodal_encoder.intern_vit.modeling_intern_vit import InternVisionModel, has_flash_attn
+from llava.model.multimodal_model.internvl2_5.configuration_internvl_chat import InternVLChatConfig
+from llava.model.multimodal_encoder.intern_vit.modeling_intern_vit import InternVisionModel, has_flash_attn
+from llava.conversation import get_conv_template
 
 
 logger = logging.get_logger(__name__)

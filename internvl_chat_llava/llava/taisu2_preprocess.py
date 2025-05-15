@@ -1,12 +1,18 @@
-import re, os
+import io, os, re
 import random
-from typing import Union, List, Tuple, Dict
-from pathlib import Path
-import conversation as conversation_lib
-from conversation import default_conversation
-from constants import IMG_START_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN
-from constants import IGNORE_INDEX
+from typing import Union, List, Tuple, Dict, Set
+from functools import partial
+from pathlib import Path, PosixPath
+import llava.conversation as conversation_lib
+from llava.conversation import default_conversation
+from llava.constants import IMG_START_TOKEN, IMG_CONTEXT_TOKEN, IMG_END_TOKEN
+from llava.constants import IGNORE_INDEX
+from llava.constants import IMAGENET_MEAN, IMAGENET_STD
+from PIL import Image
+from PIL.ImageFile import ImageFile
 import torch
+from torchvision import transforms as T
+from torchvision.transforms import InterpolationMode
 import transformers
 
 
@@ -16,9 +22,126 @@ TASKS_TYPE = (
              )
 
 
+__all__ = ["taisu2_img_preprocess", "load_image", "taisu2_text_preprocess", "taisu2_wds_map"]
+
+
+# All functions below are image preprocess
+def build_transform(input_size: int):
+    MEAN, STD = IMAGENET_MEAN, IMAGENET_STD
+    transform = T.Compose([
+        T.Lambda(lambda img: img.convert('RGB') if img.mode != 'RGB' else img),
+        T.Resize((input_size, input_size), interpolation=InterpolationMode.BICUBIC),
+        T.ToTensor(),
+        T.Normalize(mean=MEAN, std=STD)
+    ])
+
+    return transform
+
+
+def find_closest_aspect_ratio(
+                              aspect_ratio: float, 
+                              target_ratios: Set[Tuple[int, int]], 
+                              width: int, 
+                              height: int, 
+                              image_size: int
+                             ) -> Tuple[int, int]:
+    best_ratio_diff = float('inf')
+    best_ratio = (1, 1)
+    area = width * height
+    for ratio in target_ratios:
+        target_aspect_ratio = ratio[0] / ratio[1]
+        ratio_diff = abs(aspect_ratio - target_aspect_ratio)
+        if ratio_diff < best_ratio_diff:
+            best_ratio_diff = ratio_diff
+            best_ratio = ratio
+        elif ratio_diff == best_ratio_diff:
+            if area > 0.5 * image_size * image_size * ratio[0] * ratio[1]:
+                best_ratio = ratio
+
+    return best_ratio
+
+
+def dynamic_preprocess(
+                       image: Union[ImageFile | Image.Image], 
+                       min_num: int = 1, 
+                       max_num: int = 12, 
+                       image_size=448, 
+                       use_thumbnail: bool = False
+                      ) -> List[Image.Image | ImageFile]:
+    orig_width, orig_height = image.size
+    aspect_ratio = orig_width / orig_height
+
+    # calculate the existing image aspect ratio
+    target_ratios = set(
+        (i, j) for n in range(min_num, max_num + 1) for i in range(1, n + 1) for j in range(1, n + 1) if
+        i * j <= max_num and i * j >= min_num)
+    target_ratios = sorted(target_ratios, key=lambda x: x[0] * x[1])
+
+    # find the closest aspect ratio to the target
+    target_aspect_ratio = find_closest_aspect_ratio(
+        aspect_ratio, target_ratios, orig_width, orig_height, image_size)
+
+    # calculate the target width and height
+    target_width = image_size * target_aspect_ratio[0]
+    target_height = image_size * target_aspect_ratio[1]
+    blocks = target_aspect_ratio[0] * target_aspect_ratio[1]
+
+    # resize the image
+    resized_img = image.resize((target_width, target_height))
+    processed_images = []
+    for i in range(blocks):
+        box = (
+            (i % (target_width // image_size)) * image_size,
+            (i // (target_width // image_size)) * image_size,
+            ((i % (target_width // image_size)) + 1) * image_size,
+            ((i // (target_width // image_size)) + 1) * image_size
+        )
+        # split the image
+        split_img = resized_img.crop(box)
+        processed_images.append(split_img)
+    assert len(processed_images) == blocks
+    if use_thumbnail and len(processed_images) != 1:
+        thumbnail_img = image.resize((image_size, image_size))
+        processed_images.append(thumbnail_img)
+
+    return processed_images
+
+
+def load_image(
+               image_file: Union[str | PosixPath], 
+               input_size: int = 448, 
+               min_num: int = 1, 
+               max_num: int = 12, 
+               use_thumbnail: bool = True
+              ) -> torch.Tensor:
+    image = Image.open(image_file).convert('RGB')
+    transform = build_transform(input_size=input_size)
+    images = dynamic_preprocess(image, min_num=min_num, max_num=max_num, image_size=input_size, use_thumbnail=use_thumbnail)
+    pixel_values = [transform(image) for image in images]
+    pixel_values = torch.stack(pixel_values)
+
+    return pixel_values
+
+
+def taisu2_img_preprocess(
+                          pil_img: Union[ImageFile | Image.Image], 
+                          input_size: int = 448, 
+                          min_num: int = 1, 
+                          max_num: int = 12, 
+                          use_thumbnail: bool = True
+                         ) -> Tuple[torch.Tensor, int]:
+    transform = build_transform(input_size=input_size)
+    pil_images = dynamic_preprocess(pil_img, min_num=min_num, max_num=max_num, image_size=input_size, use_thumbnail=use_thumbnail)
+    pixel_values = [transform(pil_image) for pil_image in pil_images]
+    pixel_values = torch.stack(pixel_values)
+
+    return dict(pixel_value=pixel_values, sub_img_num=len(pil_images))
+
+
+# All functions below are text preprocess
 def taisu2_preprocess_internvl2_5(
-                                  imgnames: Union[str | List[str] | Tuple[str]], 
                                   anns: str, 
+                                  data_stem_name: str, 
                                   task_type: str, 
                                   context_token_per_img: int, 
                                   sub_img_num: Union[int | List[int] | Tuple[int]], 
@@ -98,7 +221,7 @@ def taisu2_preprocess_internvl2_5(
         if native_caption is None and re_caption is None:
             native_caption = anns
         if (not native_caption) and re_caption is None:
-            raise ValueError(f"image-alttext pairs with name {imgnames} does not have an effective native caption and re-caption")
+            raise ValueError(f"image-alttext pairs with stem name {data_stem_name} does not have an effective native caption and re-caption")
         if native_caption and re_caption:
             prompt_str = random.choice(two_caption_prompts)
             user_prompt = prompt_str.format(native_caption=native_caption)
@@ -167,16 +290,18 @@ def taisu2_preprocess_internvl2_5(
 
 
 def taisu2_text_preprocess(
-                           sources: str, 
-                           imgnames: Union[str | List[str] | Tuple[int]], 
+                           sources: Union[str | List[str]], 
+                           data_stem_name: str, 
                            task_type: str, 
-                           sub_img_num: Union[int | List[int] | Tuple[int]], 
+                           sub_img_num: Union[int | List[int]], 
                            tokenizer: transformers.PreTrainedTokenizer = None, 
                            data_args = None
                           ) -> Dict[str, torch.Tensor]:
+    if isinstance(sources, list):
+        sources = data_args.txts_separator.join(sources)
     if "internvl2_5" in conversation_lib.default_conversation.name or "internvl3" in conversation_lib.default_conversation.name:
         return taisu2_preprocess_internvl2_5(
-                                             imgnames=imgnames, 
+                                             data_stem_name=data_stem_name, 
                                              anns=sources, 
                                              task_type=task_type, 
                                              context_token_per_img=data_args.context_token_per_img, 
@@ -187,3 +312,58 @@ def taisu2_text_preprocess(
                                              return_tensors=data_args.return_tensors, 
                                              return_attention_mask=data_args.return_attention_mask
                                             )
+
+
+def taisu2_wds_map(
+                   wds_sample: Dict[str, str | bytes | Dict[str, bytes]], 
+                   tokenizer: transformers.PreTrainedTokenizer = None, 
+                   data_args = None
+                  ):
+    no_img = "jpg" not in wds_sample and "jpeg" not in wds_sample and "png" not in wds_sample
+    no_txt = "txt" not in wds_sample; no_json = "json" not in wds_sample
+    if no_img or no_txt:
+        raise KeyError(f"each sample dictionary must have image and text keys")
+    if "image-alttext" in wds_sample["__url__"]:
+        task_type = "caption"
+    if not (isinstance(wds_sample["jpg"], (bytes, dict)) and isinstance(wds_sample["txt"], (bytes, dict))):
+        raise TypeError(f"image/text gotten from webdataset could only be bytes or dictionary, "
+                        f"but recieved image: {type(wds_sample["jpg"])}, "
+                        f"and text: {type(wds_sample["txt"])}")
+    wds_img_map = partial(
+                          taisu2_img_preprocess, 
+                          input_size=data_args.base_img_size, 
+                          min_num=data_args.min_subimg_num, 
+                          max_num=data_args.max_subimg_num, 
+                          use_thumbnail=data_args.use_thumbnail, 
+                         )
+    if isinstance(wds_sample["jpg"], bytes):
+        pil_img = Image.open(io.BytesIO(wds_sample["jpg"])).convert("RGB")
+        pixel_values, sub_img_num = wds_img_map(pil_img)
+    else:
+        imgs_list = []
+        sub_img_num = []
+        for img_idx in sorted(wds_sample["jpg"].keys()):
+            img_bytes = wds_sample["jpg"][img_idx]
+            pil_img = Image.open(io.BytesIO(img_bytes)).convert("RGB")
+            img_map_res = wds_img_map(pil_img)
+            imgs_list.append(img_map_res[0]); sub_img_num.append(img_map_res[1])
+        pixel_values = torch.cat(imgs_list, dim=0)
+    data_stem_name = wds_sample["__key__"]
+
+    wds_text_map = partial(taisu2_text_preprocess, tokenizer=tokenizer, data_args=data_args)
+    if isinstance(wds_sample["txt"], bytes):
+        src_txt = wds_sample["txt"].decode(encoding="utf-8")
+    else:
+        src_txt = []
+        for txt_idx in sorted(wds_sample["txt"].keys()):
+            txt_bytes = wds_sample["txt"][txt_idx]
+            src_txt.append(txt_bytes.decode(encoding="utf-8"))
+    text_map_res = wds_text_map(src_txt, data_stem_name, task_type, sub_img_num)
+    input_ids = text_map_res["input_ids"]
+    labels = text_map_res["labels"]
+
+    return dict(
+                input_ids=input_ids, 
+                pixel_values=pixel_values, 
+                labels=labels
+               )
